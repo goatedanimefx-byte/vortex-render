@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Why The Rich Borrow From Their Own Company — PAPERCUT VOX</title>
+<style>
+  html,body{margin:0;padding:0;background:#0e0b09;overflow:hidden}
+  canvas{display:block}
+  /* Preview-only: fit the 1920x1080 canvas inside any window, letterboxed.
+     In render mode (?noply) these overrides are never applied, so captured
+     frames are always true 1920x1080. */
+  body.fit{width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
+  body.fit canvas{max-width:100vw;max-height:100vh;width:auto;height:auto}
+</style>
+</head>
+<body>
+<canvas id="c" width="2560" height="1440"></canvas>
+<script>
+"use strict";
+/* ==========================================================================
+   PAPERCUT VOX — business layer
+   2.5D: flat paper layers given real depth via drop shadows + parallax.
+   Pure function of t. No Math.random() anywhere in the draw path.
+   Contract: window.VORTEX = { duration, seek(t) }
+   ========================================================================== */
+
+const W = 1920, H = 1080;
+const cv = document.getElementById('c');
+const g  = cv.getContext('2d');
+const DUR = 58.0;
+
+/* ---------- palette: warm cream paper under tungsten ------------------- */
+const INK   = '#2a211a';
+const INK2  = '#5a4b3d';
+const RED   = '#b8332a';
+const GREEN = '#4a7a52';
+const CREAM = ['#efe3cd','#e9dcc3','#f3e9d6','#e4d6ba'];
+const ACCENT= '#c98a3c';
+
+/* ---------- seeded noise (deterministic, pure fn of index) ------------- */
+function hash(i){ const x = Math.sin(i*127.1+311.7)*43758.5453; return x-Math.floor(x); }
+function vnoise(t, s){                       // smooth value noise
+  const i = Math.floor(t*s), f = t*s - i;
+  const u = f*f*(3-2*f);
+  return hash(i)*(1-u) + hash(i+1)*u;
+}
+
+/* ---------- easing ---------------------------------------------------- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const ease = t=>t<0?0:t>1?1:t*t*(3-2*t);
+const easeO=t=>1-Math.pow(1-clamp(t,0,1),3);
+const win  =(t,a,b)=>ease((t-a)/(b-a||1e-6));           // window 0->1
+const wout =(t,a,b)=>1-ease((t-a)/(b-a||1e-6));
+
+/* ---------- hand-cut paper shape -------------------------------------- */
+function deckle(x,y,w,h,seed,rough=9){
+  // a rectangle with a torn/deckled edge — the 2.5D "hand-cut" signature
+  const p = new Path2D(), step = 26, amp = rough;
+  const edge=(x0,y0,x1,y1,k)=>{
+    const d = Math.hypot(x1-x0,y1-y0), n = Math.max(2,Math.floor(d/step));
+    for(let i=0;i<=n;i++){
+      const tt=i/n, px=x0+(x1-x0)*tt, py=y0+(y1-y0)*tt;
+      const nx=(y1-y0)/d, ny=-(x1-x0)/d;
+      const off=(hash(seed+k+i*3.3)-0.5)*2*amp;
+      const X=px+nx*off, Y=py+ny*off;
+      if(i===0&&k===0) p.moveTo(X,Y); else p.lineTo(X,Y);
+    }
+  };
+  edge(x,y,x+w,y,1); edge(x+w,y,x+w,y+h,2);
+  edge(x+w,y+h,x,y+h,3); edge(x,y+h,x,y,4);
+  p.closePath(); return p;
+}
+
+function paperCard(x,y,w,h,seed,tint,rot=0,depth=26){
+  // depth = the 2.5D. Real shadow offset scales with camera "height".
+  g.save();
+  g.translate(x+w/2,y+h/2); g.rotate(rot); g.translate(-w/2,-h/2);
+  g.shadowColor='rgba(40,26,14,0.42)';
+  g.shadowBlur=depth; g.shadowOffsetX=depth*0.34; g.shadowOffsetY=depth*0.42;
+  const tintArr = tint||CREAM[seed%CREAM.length];
+  g.fillStyle = tintArr;
+  g.fill(deckle(0,0,w,h,seed*17.3));
+  g.shadowColor='transparent';
+  // fibre grain
+  g.save(); g.clip(deckle(0,0,w,h,seed*17.3));
+  for(let i=0;i<w*h/900;i++){
+    const px=hash(seed*3+i)*w, py=hash(seed*7+i*1.7)*h, a=hash(i*2.3)*0.05;
+    g.fillStyle=`rgba(90,70,48,${a})`;
+    g.fillRect(px,py,2.2,1.4);
+  }
+  g.restore();
+  // cut edge highlight
+  g.strokeStyle='rgba(255,248,232,0.55)'; g.lineWidth=1.6;
+  g.stroke(deckle(0,0,w,h,seed*17.3));
+  g.restore();
+}
+
+function tape(x,y,w,h,rot){
+  g.save(); g.translate(x,y); g.rotate(rot);
+  g.fillStyle='rgba(226,214,178,0.62)';
+  g.fillRect(-w/2,-h/2,w,h);
+  g.strokeStyle='rgba(255,250,236,0.28)'; g.lineWidth=1; g.strokeRect(-w/2,-h/2,w,h);
+  g.restore();
+}
+
+function stamp(x,y,txt,col,rot,scale,alpha){
+  g.save();
+  g.translate(x,y); g.rotate(rot); g.scale(scale,scale);
+  g.globalAlpha = alpha;
+  g.strokeStyle=col; g.lineWidth=4.5;
+  const w = g.measureText(txt).width + 46;
+  const h = 62;
+  g.strokeRect(-w/2,-h/2,w,h);
+  g.lineWidth=1.4; g.strokeRect(-w/2+7,-h/2+7,w-14,h-14);
+  g.fillStyle=col; g.font='700 32px "Courier New",monospace'; g.textAlign='center';
+  g.fillText(txt,0,10);
+  g.restore();
+}
+
+/* torn sheet wipe between beats */
+function tornWipe(t,t0,t1,W2){
+  const k = win(t,t0,t0+0.42);
+  if(k<=0) return 0;
+  if(k>=1) return 1;
+  return k;
+}
+function drawWipe(t,t0,flip){
+  const k = tornWipe(t,t0,t0+0.42);
+  if(k<=0||k>=1) return;
+  const edge = flip ? W*(1-k) : -W*0.28 + k*W*0.30;
+  g.save();
+  g.beginPath();
+  g.moveTo(edge-40,-10); g.lineTo(edge+60,-10); g.lineTo(edge+60,H+10); g.lineTo(edge-40,H+10); g.closePath();
+  for(let y=0;y<=H;y+=18){
+    g.lineTo(edge + (hash(y*0.11)-0.5)*26, y);
+  }
+  g.closePath();
+  g.fillStyle='#f2e8d4'; g.fill();
+  g.strokeStyle='rgba(120,96,64,0.30)'; g.lineWidth=2; g.stroke();
+  g.restore();
+}
+
+/* ---------- type ------------------------------------------------------- */
+function fitText(txt,maxW,font){
+  g.font=font;
+  if(g.measureText(txt).width<=maxW) return txt;
+  let t=txt;
+  while(t.length>4 && g.measureText(t+'...').width>maxW) t=t.slice(0,-1);
+  return t+'...';
+}
+function writeLine(txt,x,y,font,col,align){
+  g.font=font; g.fillStyle=col; g.textAlign=align||'left';
+  g.fillText(txt,x,y);
+}
+
+/* ==========================================================================
+   BEATS
+   ========================================================================== */
+const BEATS = [
+  {t0:0.0,  t1:8.0,  tag:'HOOK'},
+  {t0:8.0,  t1:18.0, tag:'SETUP'},
+  {t0:18.0, t1:30.0, tag:'TRICK'},
+  {t0:30.0, t1:40.0, tag:'REVEAL'},
+  {t0:40.0, t1:46.0, tag:'MECHANIC'},
+  {t0:46.0, t1:52.0, tag:'PAYOFF'},
+  {t0:52.0, t1:57.0, tag:'PUNCH'},
+  {t0:57.0, t1:58.0, tag:'CATCH'},
+];
+function beatAt(t){ for(let i=BEATS.length-1;i>=0;i--) if(t>=BEATS[i].t0) return i; return 0; }
+
+/* ==========================================================================
+   BACKGROUND — always alive so no frame is ever static
+   ========================================================================== */
+function drawBG(t){
+  // A warm DESK, not a void. Cream paper needs a mid-tone ground to sit on or
+  // it reads as shapes floating on black.
+  const g2=g.createLinearGradient(0,0,W*0.45,H);
+  g2.addColorStop(0,'#6b543c'); g2.addColorStop(0.5,'#54402e'); g2.addColorStop(1,'#3a2c20');
+  g.fillStyle=g2; g.fillRect(0,0,W,H);
+  // tungsten pool from upper left
+  const p = g.createRadialGradient(W*0.42,H*0.34,40,W*0.42,H*0.34,W*0.85);
+  p.addColorStop(0,'rgba(255,222,170,0.34)');
+  p.addColorStop(0.45,'rgba(220,175,120,0.13)');
+  p.addColorStop(1,'rgba(20,12,6,0.30)');
+  g.fillStyle=p; g.fillRect(0,0,W,H);
+  // desk wood grain
+  g.strokeStyle='rgba(30,18,8,0.16)'; g.lineWidth=2;
+  for(let i=0;i<34;i++){
+    const y=hash(i*5.1)*H;
+    g.beginPath(); g.moveTo(0,y); g.lineTo(W,y+Math.sin(t*0.25+i)*4); g.stroke();
+  }
+  // vignette
+  const vg=g.createRadialGradient(W/2,H/2,H*0.42,W/2,H/2,W*0.82);
+  vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(18,10,4,0.52)');
+  g.fillStyle=vg; g.fillRect(0,0,W,H);
+  // drifting dust motes
+  g.fillStyle='rgba(255,238,206,0.20)';
+  for(let i=0;i<150;i++){
+    const sp=0.25+hash(i*3.7)*0.9;
+    const x=(hash(i*1.3)*W + Math.sin(t*0.20*sp+i)*46 + W) % W;
+    const y=((hash(i*2.9)*H + t*13*sp) % (H+60)) - 30;
+    g.fillRect(x,y,3.0,3.0);
+  }
+  // ALWAYS-MOVING light sweep. Without this the opening 0.15s (before any card
+  // fades in) reads as a frozen frame.
+  const sw = (t*0.16) % 1.6 - 0.3;
+  const swx = sw*W;
+  const sg = g.createLinearGradient(swx-460, 0, swx+460, H);
+  sg.addColorStop(0,'rgba(255,226,176,0)');
+  sg.addColorStop(0.5,'rgba(255,226,176,0.075)');
+  sg.addColorStop(1,'rgba(255,226,176,0)');
+  g.fillStyle=sg; g.fillRect(0,0,W,H);
+  // slow tungsten breathing so the ground itself is never static
+  const br = 0.30 + 0.055*Math.sin(t*0.42);
+  const bp = g.createRadialGradient(W*0.42,H*0.34,40,W*0.42,H*0.34,W*0.85);
+  bp.addColorStop(0,`rgba(255,222,170,${br})`);
+  bp.addColorStop(0.45,'rgba(220,175,120,0.13)');
+  bp.addColorStop(1,'rgba(20,12,6,0.30)');
+  g.fillStyle=bp; g.fillRect(0,0,W,H);
+}
+
+/* ==========================================================================
+   BEAT RENDERERS
+   ========================================================================== */
+
+/* --- 0 HOOK: paycheck card, torn in half --- */
+function beatHook(t,bi,cam){
+  const B=BEATS[bi], u=(t-B.t0)/(B.t1-B.t0);
+  const cx=W*0.5 - cam.panX;
+
+  // headline lives ON a paper card, or dark ink on a dark desk is unreadable
+  const kb=win(t,B.t0+0.15,B.t0+0.9);
+  if(kb>0){
+    const bw=1420,bh=430, by=H*0.17;
+    g.save();
+    g.globalAlpha=kb;
+    paperCard(cx-bw/2, by, bw, bh, 5, CREAM[0], -0.004, 54);
+    g.restore();
+    tape(cx-bw/2+bw*0.12, by-14, 150,46, -0.16);
+    tape(cx+bw/2-bw*0.12, by-14, 150,46,  0.14);
+  }
+
+  const lines=['Why do the richest people','never get rich','from a salary?'];
+  lines.forEach((ln,i)=>{
+    const s=win(t, B.t0+0.35+i*0.52, B.t0+1.5+i*0.52);
+    if(s<=0) return;
+    const y=H*0.17+130 + i*96;
+    g.save();
+    g.globalAlpha = s;
+    g.translate(cx, y);
+    g.rotate((1-easeO(s))*-0.016);
+    const font='700 80px Georgia,"Times New Roman",serif';
+    writeLine(fitText(ln, W*0.68, font), 0,0, font, i===2?RED:INK, 'center');
+    if(i===2){
+      g.strokeStyle='rgba(184,51,42,0.65)'; g.lineWidth=4;
+      const tw=g.measureText(ln).width;
+      g.beginPath(); g.moveTo(-tw/2,18); g.lineTo(tw/2,18); g.stroke();
+    }
+    g.restore();
+  });
+
+  // paycheck card: slides in, then tears in half
+  const pin = win(t,B.t0+2.6,B.t0+3.6);
+  const tear = win(t,B.t0+4.8,B.t0+5.8);
+  const py = H*0.68 + (1-easeO(pin))*70 - cam.panY;
+  const pw = 760, ph = 200;
+  if(pin>0){
+    for(const sgn of [-1,1]){
+      const off = sgn*tear*140;
+      const sc = 1 - tear*0.10;
+      paperCard(cx-pw/2+off, py, pw*sc, ph*sc, 3, CREAM[1], sgn*tear*0.035, 30);
+    }
+    g.save();
+    g.globalAlpha=pin*(1-tear);
+    writeLine('SALARY', cx, py+ph*0.46,'700 50px "Courier New",monospace',INK,'center');
+    writeLine('taxed. every. time.', cx, py+ph*0.80,'italic 400 28px Georgia,serif',INK2,'center');
+    g.restore();
+    if(tear>0.05 && tear<0.98){
+      stamp(cx+pw*0.32, py+ph*0.50,'TORN',RED,-0.14,0.9+tear*0.1,tear*0.92);
+    }
+  }
+  const k=win(t,B.t0+5.9,B.t1-0.4);
+  if(k>0){
+    g.save(); g.globalAlpha=k;
+    writeLine('they don\'t build wealth — they borrow from it',
+      cx, H*0.93, 'italic 500 38px Georgia,serif', '#f0e2c6', 'center');
+    g.restore();
+  }
+}
+
+/* --- 1 SETUP: earn vs own --- */
+function beatSetup(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5 - cam.panX;
+  const pw=580, ph=330, top=H*0.34, gap=420;
+
+  // left: earnings
+  const kl=win(t,B.t0+0.3,B.t0+1.3);
+  if(kl>0){
+    paperCard(cx-gap-pw/2, top+(1-easeO(kl))*60, pw,ph, 11, CREAM[0], -0.016, 34);
+    g.save(); g.globalAlpha=kl;
+    writeLine('MOST PEOPLE', cx-gap, top+74,'700 28px "Courier New",monospace',INK2,'center');
+    g.strokeStyle='rgba(42,33,26,0.25)'; g.lineWidth=2;
+    g.beginPath(); g.moveTo(cx-gap-190,top+104); g.lineTo(cx-gap+190,top+104); g.stroke();
+    writeLine('EARN', cx-gap, top+206,'700 92px Georgia,serif',INK,'center');
+    writeLine('money in. tax out.', cx-gap, top+272,'italic 28px Georgia,serif',INK2,'center');
+    g.restore();
+  }
+
+  // right: ownership
+  const kr=win(t,B.t0+2.0,B.t0+3.2);
+  if(kr>0){
+    const sc=0.84+0.16*easeO(kr);
+    const rw=pw*sc, rh=ph*sc;
+    paperCard(cx+gap-rw/2, top-(1-easeO(kr))*70, rw,rh, 12, CREAM[2], 0.014, 40);
+    g.save(); g.globalAlpha=kr;
+    writeLine('THE RICH', cx+gap, top+74*sc,'700 28px "Courier New",monospace',RED,'center');
+    g.strokeStyle='rgba(184,51,42,0.30)'; g.lineWidth=2;
+    g.beginPath(); g.moveTo(cx+gap-190*sc,top+104*sc); g.lineTo(cx+gap+190*sc,top+104*sc); g.stroke();
+    writeLine('OWN', cx+gap, top+206*sc,'700 92px Georgia,serif',RED,'center');
+    writeLine('a company. a machine.', cx+gap, top+272*sc,'italic 28px Georgia,serif',INK2,'center');
+    g.restore();
+    tape(cx+gap-rw*0.30, top-16, 132,44, -0.20);
+  }
+
+  // arrow across the gap between the two cards
+  const ka=win(t,B.t0+4.2,B.t1-0.6);
+  if(ka>0){
+    g.save();
+    g.strokeStyle='rgba(184,51,42,0.92)'; g.lineWidth=6; g.lineCap='round';
+    const x0=cx-gap+pw/2+16, x1=cx+gap-pw/2-16, y=top+ph*0.52;
+    g.beginPath(); g.moveTo(x0,y); g.lineTo(x0+(x1-x0)*ka, y); g.stroke();
+    if(ka>0.94){
+      const hx=x0+(x1-x0)*ka, d=16;
+      g.fillStyle='rgba(184,51,42,0.96)';
+      g.beginPath(); g.moveTo(hx,y); g.lineTo(hx-d,y-d*0.9); g.lineTo(hx-d,y+d*0.9); g.closePath(); g.fill();
+    }
+    g.restore();
+    const kt=win(t,B.t0+4.8,B.t0+5.5);
+    if(kt>0){
+      g.save(); g.globalAlpha=kt;
+      writeLine('one owns the printer', cx, H*0.80,'italic 500 40px Georgia,serif','#f0e2c6','center');
+      g.restore();
+    }
+  }
+}
+
+/* --- 2 TRICK: the loan diagram --- */
+function beatTrick(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5 - cam.panX, cy=H*0.46;
+  const bw=480, bh=330, top=cy-bh/2, gap=520;
+
+  // company card (left)
+  const kb=win(t,B.t0+0.3,B.t0+1.2);
+  const bx=cx-gap-bw/2;
+  if(kb>0){
+    paperCard(bx, top, bw,bh, 21, CREAM[1], -0.012, 44);
+    g.save(); g.globalAlpha=kb;
+    writeLine('YOUR', bx+bw/2, top+74,'700 28px "Courier New",monospace',INK2,'center');
+    writeLine('COMPANY', bx+bw/2, top+148,'700 60px Georgia,serif',INK,'center');
+    g.strokeStyle='rgba(42,33,26,0.30)'; g.lineWidth=2;
+    g.strokeRect(bx+56, top+182, bw-112, 104);
+    for(let i=0;i<5;i++){
+      const a=win(t,B.t0+1.1+i*0.34, B.t0+1.6+i*0.34);
+      g.fillStyle=`rgba(42,33,26,${a*0.55})`;
+      g.fillRect(bx+76, top+200+i*17, (bw-152)*(0.42+0.46*hash(i*7.7)), 8);
+    }
+    g.restore();
+    tape(bx+bw*0.16, top-16, 132,44, 0.19);
+  }
+
+  // owner card (right)
+  const ko=win(t,B.t0+1.6,B.t0+2.5);
+  const ox=cx+gap-bw/2;
+  if(ko>0){
+    paperCard(ox, top, bw,bh, 22, CREAM[3], 0.010, 44);
+    g.save(); g.globalAlpha=ko;
+    writeLine('PAID TO', ox+bw/2, top+74,'700 28px "Courier New",monospace',INK2,'center');
+    writeLine('YOU', ox+bw/2, top+160,'700 76px Georgia,serif',RED,'center');
+    g.restore();
+    tape(ox+bw*0.70, top-16, 132,44, -0.17);
+  }
+
+  // arrow between the cards — real length because both cards exist
+  const ka=win(t,B.t0+3.0,B.t0+4.2);
+  if(ka>0){
+    const x0=bx+bw+18, x1=ox-18, y=cy;
+    g.save();
+    g.strokeStyle=ACCENT; g.lineWidth=8; g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y); g.lineTo(x0+(x1-x0)*ka, y); g.stroke();
+    if(ka>0.9){
+      const hx=x0+(x1-x0)*ka;
+      g.fillStyle=ACCENT;
+      g.beginPath(); g.moveTo(hx,y); g.lineTo(hx-24,y-18); g.lineTo(hx-24,y+18); g.closePath(); g.fill();
+    }
+    g.restore();
+    const kl=win(t,B.t0+3.8,B.t0+4.6);
+    if(kl>0){
+      g.save(); g.globalAlpha=kl;
+      writeLine('"a loan"', cx, cy+62,'italic 700 44px Georgia,serif',RED,'center');
+      g.restore();
+    }
+  }
+
+  const s1=win(t,B.t0+5.6,B.t0+6.6);
+  if(s1>0) stamp(cx-gap, cy+bh/2+104, '0% INTEREST', RED, -0.08, 1.08, s1);
+  const s2=win(t,B.t0+7.4,B.t1-0.4);
+  if(s2>0) stamp(cx+gap, cy+bh/2+104, 'FOR 50 YEARS', INK, 0.06, 1.08, s2);
+}
+
+/* --- 3 REVEAL: loan != income --- */
+function beatReveal(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5-cam.panX, cy=H*0.48;
+
+  const k=win(t,B.t0+0.3,B.t0+1.4);
+  if(k<=0) return;
+  const bw=1120,bh=420;
+  paperCard(cx-bw/2,cy-bh/2,bw,bh,31,CREAM[0],0,52);
+  g.save(); g.globalAlpha=k;
+  g.translate(cx,cy); g.scale(0.94+0.06*easeO(k),0.94+0.06*easeO(k));
+  writeLine('A LOAN',0,-84,'700 104px Georgia,serif',INK,'center');
+  const kx=win(t,B.t0+2.0,B.t0+3.0);
+  if(kx>0){
+    g.save();
+    g.strokeStyle=RED; g.lineWidth=9; g.lineCap='round';
+    g.beginPath(); g.moveTo(-250,-118); g.lineTo(250,-118); g.stroke();
+    g.beginPath(); g.moveTo(250,-118); g.lineTo(206,-150); g.moveTo(250,-118); g.lineTo(206,-86);
+    g.stroke();
+    const ne=win(t,B.t0+3.1,B.t0+3.9);
+    if(ne>0){
+      g.globalAlpha=ne; writeLine('≠',0,-134,'700 150px Georgia,serif',RED,'center');
+    }
+    g.restore();
+  }
+  const ki=win(t,B.t0+3.6,B.t0+4.7);
+  if(ki>0){
+    g.save(); g.globalAlpha=ki;
+    writeLine('INCOME',0,96,'700 104px Georgia,serif',INK,'center');
+    g.restore();
+  }
+  const kn=win(t,B.t0+5.6,B.t1-0.6);
+  if(kn>0){
+    g.save(); g.globalAlpha=kn;
+    writeLine('it was never income — it was a loan',cx,cy+bh/2+96,'italic 500 38px Georgia,serif','rgba(238,224,198,0.85)','center');
+    g.restore();
+  }
+  g.restore();
+}
+
+/* --- 4 MECHANIC: deduction, no repayment --- */
+function beatMechanic(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5-cam.panX, cy=H*0.46;
+  const bw=340,bh=300, by=cy+250;     // bar box bottom; labels live INSIDE the card
+
+  const bars=[{l:'INTEREST PAID',v:0.78,col:'#6f9c78'},{l:'DEDUCTION',v:0.78,col:'#6f9c78'}];
+  bars.forEach((b,i)=>{
+    const k=win(t,B.t0+0.3+i*0.5, B.t0+1.5+i*0.5);
+    if(k<=0) return;
+    const bx=cx-460+i*640;
+    // card spans from label row down past the bar baseline
+    paperCard(bx-52, by-bh-130, bw+104, bh+230, 41+i, CREAM[2], (i?1:-1)*0.01, 30);
+    g.save(); g.globalAlpha=k;
+    // label INSIDE the card, above the bar
+    writeLine(b.l, bx+bw/2, by-bh-96,'700 26px "Courier New",monospace',INK,'center');
+    const h=bh*b.v*k;
+    const grd=g.createLinearGradient(0,by-h,0,by);
+    grd.addColorStop(0,'#7fae88'); grd.addColorStop(1,'#3f6647');
+    g.fillStyle=grd; g.fillRect(bx,by-h,bw,h);
+    g.strokeStyle='rgba(42,33,26,0.45)'; g.lineWidth=2.5; g.strokeRect(bx,by-h,bw,h);
+    // value tag sits inside the card too
+    writeLine('-'+Math.round(b.v*100)+'%', bx+bw/2, by-bh-30,'700 52px Georgia,serif',GREEN,'center');
+    g.restore();
+  });
+
+  const kn=win(t,B.t0+2.8,B.t1-0.4);
+  if(kn>0){
+    g.save(); g.globalAlpha=kn;
+    writeLine('the company never repays a cent', cx, H*0.12,'italic 500 46px Georgia,serif','#f2e4c8','center');
+    if(kn>0.15) stamp(cx+470, H*0.90, 'ZERO REPAYMENT', ACCENT, -0.07, 1.05, kn);
+    g.restore();
+  }
+}
+
+/* --- 5 PAYOFF: rates compared --- */
+function beatPayoff(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5-cam.panX;
+  const by=H*0.86, bh=390;              // baseline + bar height
+  const data=[{l:'TAXED AS INCOME',v:0.92,col:'#b8332a',t:'37%'},
+              {l:'TAXED AS GAINS',  v:0.46,col:'#4a7a52',t:'15%'}];
+  const bw=460;
+
+  data.forEach((d,i)=>{
+    const k=win(t,B.t0+0.4+i*0.9, B.t0+1.9+i*0.9);
+    if(k<=0) return;
+    const bx=cx-680+i*760;
+    // card from above the value tag down past the baseline
+    paperCard(bx-54, by-bh-180, bw+108, bh+260, 51+i, CREAM[i], (i?0.012:-0.012), 44);
+    g.save(); g.globalAlpha=k;
+    writeLine(d.l, bx+bw/2, by-bh-146,'700 28px "Courier New",monospace',INK,'center');
+    const h=bh*d.v*k;
+    const grd=g.createLinearGradient(0,by-h,0,by);
+    grd.addColorStop(0,i?'#6f9c78':'#d0574a'); grd.addColorStop(1,i?'#3f6647':'#8e2a22');
+    g.fillStyle=grd; g.fillRect(bx,by-h,bw,h);
+    g.strokeStyle='rgba(42,33,26,0.45)'; g.lineWidth=2.5; g.strokeRect(bx,by-h,bw,h);
+    const kt=win(t,B.t0+2.1+i*0.9,B.t0+2.7+i*0.9);
+    if(kt>0){
+      g.save(); g.globalAlpha=kt;
+      writeLine(d.t, bx+bw/2, by-bh-46,'700 76px Georgia,serif',d.col,'center');
+      g.restore();
+    }
+    g.restore();
+  });
+
+  const kd=win(t,B.t0+3.4,B.t1-0.4);
+  if(kd>0){
+    g.save(); g.globalAlpha=kd;
+    writeLine('the same forgiveness. half the tax.', cx, H*0.13,'italic 500 44px Georgia,serif','#f2e4c8','center');
+    if(kd>0.3) stamp(cx+520, H*0.24, 'LOWER RATE', GREEN, -0.09, 1.05, kd);
+    g.restore();
+  }
+}
+
+/* --- 6 PUNCH: the word flips --- */
+function beatPunch(t,bi,cam){
+  const B=BEATS[bi];
+  const cx=W*0.5-cam.panX, cy=H*0.50;
+  const flip = win(t,B.t0+0.6,B.t0+1.8);
+
+  const bw=900,bh=230;
+  paperCard(cx-bw/2,cy-bh/2,bw,bh,61,CREAM[3],0,50);
+  g.save(); g.globalAlpha=1;
+  const sc = 1 - Math.abs(Math.sin(flip*Math.PI))*0.92;
+  g.translate(cx,cy); g.scale(Math.max(0.06,sc),1);
+  writeLine('"LOAN"',0,26,'700 108px Georgia,serif',RED,'center');
+  g.restore();
+
+  const k1=win(t,B.t0+2.0,B.t0+3.0);
+  if(k1>0){
+    g.save(); g.globalAlpha=k1;
+    writeLine('the rich didn\'t get richer by working harder.',cx,cy+230,'italic 500 40px Georgia,serif','rgba(238,224,198,0.86)','center');
+    g.restore();
+  }
+  const k2=win(t,B.t0+3.4,B.t1-0.5);
+  if(k2>0){
+    const s=win(t,B.t0+3.4,B.t0+3.9);
+    g.save(); g.globalAlpha=k2;
+    writeLine('they changed what the word "loan" means.',cx,cy+296,'italic 500 40px Georgia,serif','#e8c07a','center');
+    g.restore();
+  }
+}
+
+/* --- 7 CATCH: IRS --- */
+function beatCatch(t,bi,cam){
+  const B=BEATS[bi], cx=W*0.5-cam.panX, cy=H*0.50;
+  const k=win(t,B.t0+0.15,B.t0+0.6);
+  const slam=1-easeO(k);
+  g.save();
+  g.translate(cx,cy); g.rotate(slam*0.30); g.scale(1+slam*0.28,1+slam*0.28);
+  g.globalAlpha=k;
+  const bw=760,bh=250;
+  g.shadowColor='rgba(0,0,0,0.5)'; g.shadowBlur=40; g.shadowOffsetY=14;
+  g.fillStyle='#f2e8d4'; g.fillRect(-bw/2,-bh/2,bw,bh);
+  g.shadowColor='transparent';
+  g.strokeStyle=RED; g.lineWidth=8; g.strokeRect(-bw/2+16,-bh/2+16,bw-32,bh-32);
+  g.fillStyle=RED; g.font='700 88px "Courier New",monospace'; g.textAlign='center';
+  g.fillText('IRS',0,26);
+  g.font='700 26px "Courier New",monospace';
+  g.fillText('IN COURT',0,74);
+  g.restore();
+  const k2=win(t,B.t0+0.7,B.t1);
+  if(k2>0){
+    g.save(); g.globalAlpha=k2;
+    writeLine('they have been fighting this for years',cx,cy+230,'italic 500 38px Georgia,serif','rgba(240,228,202,0.9)','center');
+    g.restore();
+  }
+}
+
+/* ==========================================================================
+   CAMERA — 2.5D: lateral pan A->B per beat + constant drift + slow push
+   ========================================================================== */
+function camera(t){
+  const bi=beatAt(t), B=BEATS[bi], u=clamp((t-B.t0)/(B.t1-B.t0),0,1);
+  const e=easeO(u);
+  // A -> B per beat: each beat pans a different amplitude/direction
+  const PANS=[[-60,40],[70,-30],[-52,26],[38,-18],[46,-34],[-40,30],[30,-22],[-18,10]];
+  const p=PANS[bi%PANS.length];
+  const panX = p[0]*(2*e-1)*0.5 + Math.sin(t*0.17)*14;
+  const panY = p[1]*(2*e-1)*0.5 + Math.cos(t*0.13)*9;
+  const kick = (1-easeO(win(t,B.t0,B.t0+0.5)))*26;
+  const push = 1 + 0.030*Math.sin(u*Math.PI) - kick*0.0016;
+  return {panX,panY,scale:push, bi};
+}
+
+/* ==========================================================================
+   FRAME
+   ========================================================================== */
+function draw(t){
+  t = clamp(t, 0, DUR-0.001);
+  g.setTransform(1,0,0,1,0,0);
+  g.clearRect(0,0,2560,1440);
+  // 2.5D logical space is 1920x1080, scaled to 2560x1440 (2K) for crisp output
+  g.scale(2560/1920, 1440/1080);
+  drawBG(t);
+
+  const cam=camera(t), bi=cam.bi, B=BEATS[bi];
+
+  // 2.5D: apply camera as a scaled/translated world transform
+  g.save();
+  g.translate(W/2,H/2);
+  g.scale(cam.scale,cam.scale);
+  g.rotate(Math.sin(t*0.24)*0.0035);
+  g.translate(-W/2,-H/2);
+
+  switch(bi){
+    case 0: beatHook(t,bi,cam); break;
+    case 1: beatSetup(t,bi,cam); break;
+    case 2: beatTrick(t,bi,cam); break;
+    case 3: beatReveal(t,bi,cam); break;
+    case 4: beatMechanic(t,bi,cam); break;
+    case 5: beatPayoff(t,bi,cam); break;
+    case 6: beatPunch(t,bi,cam); break;
+    case 7: beatCatch(t,bi,cam); break;
+  }
+  g.restore();
+
+  g.setTransform(1,0,0,1,0,0);   // reset scale before DOM-independent overlays
+
+  // torn-paper wipe at each cut
+  for(let i=1;i<BEATS.length;i++) drawWipe(t, BEATS[i].t0, false);
+
+  // persistent corner marks (evidence board feel) — always alive
+  g.save();
+  g.globalAlpha=0.30;
+  g.strokeStyle='#e8c07a'; g.lineWidth=2;
+  const m=44, L=34;
+  [[m,m,1,1],[W-m,m,-1,1],[m,H-m,1,-1],[W-m,H-m,-1,-1]].forEach((p)=>{
+    g.beginPath(); g.moveTo(p[0],p[1]+p[3]*L); g.lineTo(p[0],p[1]); g.lineTo(p[0]+p[2]*L,p[1]); g.stroke();
+  });
+  g.restore();
+
+  // beat tag bottom-left
+  g.save();
+  g.globalAlpha=0.55;
+  g.fillStyle='#e8c07a'; g.font='700 17px "Courier New",monospace'; g.textAlign='left';
+  g.fillText(String(bi+1).padStart(2,'0')+' / '+String(BEATS.length).padStart(2,'0')+'   '+B.tag, 58, H-52);
+  g.restore();
+
+  // progress hairline
+  g.save();
+  g.fillStyle='rgba(232,192,122,0.55)';
+  g.fillRect(0,H-8, W*(t/DUR), 8);
+  g.restore();
+}
+
+/* ==========================================================================
+   CONTRACT
+   ========================================================================== */
+draw(0);
+window.VORTEX = {
+  duration: DUR,
+  seek: function(t){ draw(t); }
+};
+
+/* preview player (browser only — render.py uses VORTEX.seek and is unaffected) */
+(function(){
+  if (location.search.indexOf('noply') >= 0) return;   // render-safe mode
+  // fit the fixed-size canvas to the window so nothing is cut off
+  document.body.classList.add('fit');
+  let t = 0, playing = true, last = performance.now();
+  const bar = document.createElement('div');
+  bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:16px;'+
+    'background:rgba(0,0,0,.45);cursor:pointer;z-index:9';
+  const fill = document.createElement('div');
+  fill.style.cssText = 'height:100%;width:0;background:#e8c07a';
+  bar.appendChild(fill);
+  const btn = document.createElement('button');
+  btn.textContent = '❚❚  PAUSE';
+  btn.style.cssText = 'position:fixed;right:14px;bottom:26px;z-index:10;padding:8px 16px;'+
+    'font:600 13px "Courier New",monospace;letter-spacing:1px;background:#1a1410;color:#e8c07a;'+
+    'border:1px solid #e8c07a;cursor:pointer';
+  const info = document.createElement('div');
+  // top-left: bottom-left is occupied by the in-canvas beat tag
+  info.style.cssText = 'position:fixed;left:14px;top:12px;z-index:10;color:#e8c07a;'+
+    'font:600 13px "Courier New",monospace;letter-spacing:1px;text-shadow:0 1px 4px #000;'+
+    'background:rgba(20,14,8,0.55);padding:5px 10px;border:1px solid rgba(232,192,122,0.35)';
+  document.body.appendChild(bar); document.body.appendChild(btn); document.body.appendChild(info);
+
+  function frame(now){
+    const dt = Math.min(0.1,(now-last)/1000); last = now;
+    if (playing){ t += dt; if (t >= DUR) t = 0; }
+    draw(t);
+    fill.style.width = (100*t/DUR)+'%';
+    info.textContent = t.toFixed(2)+'s / '+DUR+'s   ·   '+Math.round(1920)+'x1080 · 24fps · '+
+      'F12 → Console for errors';
+    requestAnimationFrame(frame);
+  }
+  btn.onclick = ()=>{ playing=!playing; btn.textContent = playing?'❚❚  PAUSE':'▶  PLAY'; };
+  bar.onclick = (e)=>{ t = (e.clientX/window.innerWidth)*DUR; draw(t); };
+  window.addEventListener('keydown',e=>{
+    if(e.code==='Space'){ e.preventDefault(); btn.onclick(); }
+    if(e.code==='ArrowRight'){ t=Math.min(DUR,t+1); draw(t); }
+    if(e.code==='ArrowLeft'){ t=Math.max(0,t-1); draw(t); }
+  });
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

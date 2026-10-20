@@ -1,0 +1,54 @@
+name: Render Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project folder name (under compositions/)'
+        required: true
+        default: 'loan-strategy'
+      fps:
+        description: 'Frames per second'
+        required: false
+        default: '30'
+      width:
+        description: 'Video width'
+        required: false
+        default: '2560'
+      height:
+        description: 'Video height'
+        required: false
+        default: '1440'
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install HyperFrames
+        run: npm install -g hyperframes
+
+      - name: Render video
+        run: |
+          npx hyperframes render compositions/${{ github.event.inputs.project }} \
+            --output out/video.mp4 \
+            --fps ${{ github.event.inputs.fps }} \
+            --width ${{ github.event.inputs.width }} \
+            --height ${{ github.event.inputs.height }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-video
+          path: out/video.mp4
+          retention-days: 7
